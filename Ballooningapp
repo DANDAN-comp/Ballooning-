@@ -1,0 +1,592 @@
+# app.py
+# Manual ballooning + Semi-auto auto-detect (OCR for scanned PDFs/images) + Rotate + Delete/Renumber + Export image
+#
+# Requirements (in your venv):
+#   pip install pyside6 pymupdf opencv-python pytesseract numpy
+#
+# Also install Tesseract OCR on Windows (required for OCR):
+#   Typical path: C:\Program Files\Tesseract-OCR\tesseract.exe
+#
+# If OCR says Tesseract not found:
+#   - Edit TESSERACT_CMD below to your actual path, OR
+#   - Add tesseract.exe folder to PATH.
+
+import sys
+import os
+import re
+import shutil
+from dataclasses import dataclass
+from typing import List, Optional
+
+from PySide6.QtCore import Qt, QPointF, QRectF
+from PySide6.QtGui import QAction, QBrush, QFont, QImage, QPainter, QPen, QPixmap, QTransform
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QSpinBox,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+import fitz  # PyMuPDF
+
+import numpy as np
+import cv2
+import pytesseract
+
+
+# -----------------------------
+# Configure Tesseract (Windows)
+# -----------------------------
+# If you installed Tesseract and it's NOT on PATH, set this to the full path.
+# Example:
+# TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_CMD = r"C:\Users\DanielAndrew\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+
+# If the file exists, force pytesseract to use it; otherwise rely on PATH.
+if os.path.exists(TESSERACT_CMD):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+
+# -----------------------------
+# Data models
+# -----------------------------
+@dataclass
+class Balloon:
+    balloon_id: int
+    x: float
+    y: float
+    radius: float
+
+
+@dataclass
+class Suggestion:
+    x: float
+    y: float
+    text: str
+
+
+# -----------------------------
+# Heuristics
+# -----------------------------
+def is_reference_dimension(text: str) -> bool:
+    t = text.strip()
+    return len(t) >= 2 and t[0] == "(" and t[-1] == ")"
+
+
+def looks_like_dimension(text: str) -> bool:
+    """
+    Semi-auto heuristic: keep things likely to be dimensions, skip noise.
+    You can tune this later.
+    """
+    t = text.strip()
+    if not t:
+        return False
+    if is_reference_dimension(t):
+        return False
+    if len(t) > 40:
+        return False
+
+    # Must contain a digit
+    if not re.search(r"\d", t):
+        return False
+
+    # Common tokens seen in dims
+    tokens = ["±", "+", "-", "Ø", "⌀", "R", "x", "X", "mm", "°", "TYP", "typ", "THRU", "thru"]
+    if any(tok in t for tok in tokens):
+        return True
+
+    # Plain numeric like 12.7
+    if re.fullmatch(r"[0-9]+(\.[0-9]+)?", t):
+        return True
+
+    # Something like 2X or 2x
+    if re.fullmatch(r"[0-9]+[xX]", t):
+        return True
+
+    # Something like .177 (leading decimal)
+    if re.fullmatch(r"\.[0-9]+", t):
+        return True
+
+    # As a fallback, allow any short digit-containing token
+    return True
+
+
+# -----------------------------
+# Graphics items
+# -----------------------------
+class BalloonItem(QGraphicsItem):
+    """Numbered balloon."""
+
+    def __init__(self, balloon: Balloon):
+        super().__init__()
+        self.balloon = balloon
+        self.setFlags(
+            QGraphicsItem.ItemIsSelectable
+            | QGraphicsItem.ItemIsMovable
+            | QGraphicsItem.ItemIsFocusable
+        )
+
+    def boundingRect(self) -> QRectF:
+        r = self.balloon.radius
+        return QRectF(-r, -r, 2 * r, 2 * r)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        r = self.balloon.radius
+
+        # Bubble
+        painter.setPen(QPen(Qt.black, 2))
+        painter.setBrush(QBrush(Qt.white))
+        painter.drawEllipse(QPointF(0, 0), r, r)
+
+        # Number (pixel sized so it scales reliably)
+        text = str(self.balloon.balloon_id)
+        digits = len(text)
+        scale = 1.25 if digits == 1 else (1.05 if digits == 2 else 0.9)
+
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(max(10, int(r * scale)))
+        painter.setFont(font)
+        painter.setPen(Qt.black)
+
+        rect = QRectF(-r, -r, 2 * r, 2 * r)
+        painter.drawText(rect, Qt.AlignCenter, text)
+
+
+class SuggestionItem(QGraphicsItem):
+    """Dashed suggested bubble. Click to accept -> becomes a numbered balloon."""
+
+    def __init__(self, suggestion: Suggestion, radius: float = 16.0):
+        super().__init__()
+        self.suggestion = suggestion
+        self.radius = radius
+        self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsFocusable)
+        self.setToolTip(suggestion.text)
+
+    def boundingRect(self) -> QRectF:
+        r = self.radius
+        return QRectF(-r, -r, 2 * r, 2 * r)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        r = self.radius
+        pen = QPen(Qt.darkBlue, 2)
+        pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(Qt.transparent))
+        painter.drawEllipse(QPointF(0, 0), r, r)
+
+        # Small "+" marker
+        painter.setPen(QPen(Qt.darkBlue, 2))
+        painter.drawLine(QPointF(-r * 0.35, 0), QPointF(r * 0.35, 0))
+        painter.drawLine(QPointF(0, -r * 0.35), QPointF(0, r * 0.35))
+
+
+# -----------------------------
+# View
+# -----------------------------
+class DrawingView(QGraphicsView):
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self.main_window: Optional["MainWindow"] = None
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.main_window:
+            item = self.itemAt(event.position().toPoint())
+
+            # Click suggestion to accept
+            if isinstance(item, SuggestionItem):
+                self.main_window.accept_suggestion(item)
+                return
+
+            # Click balloon to select/drag
+            if isinstance(item, BalloonItem):
+                super().mousePressEvent(event)
+                return
+
+            # Otherwise manual balloon
+            pos = self.mapToScene(event.position().toPoint())
+            self.main_window.add_balloon(pos.x(), pos.y())
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Middle mouse pans
+        if event.buttons() & Qt.MiddleButton:
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+        else:
+            self.setDragMode(QGraphicsView.NoDrag)
+        super().mouseMoveEvent(event)
+
+
+# -----------------------------
+# Main window
+# -----------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Ballooning Tool (Manual + OCR Semi-Auto)")
+        self.resize(1200, 800)
+
+        self.scene = QGraphicsScene(self)
+        self.view = DrawingView(self.scene, self)
+        self.view.main_window = self
+
+        self.base_image: Optional[QImage] = None
+        self.original_image: Optional[QImage] = None
+
+        self.balloons: List[Balloon] = []
+        self.balloon_items: List[BalloonItem] = []
+
+        self.suggestion_items: List[SuggestionItem] = []
+
+        self.radius_spin = QSpinBox()
+        self.radius_spin.setRange(10, 80)
+        self.radius_spin.setValue(18)
+        self.radius_spin.setToolTip("Bubble radius (px) for new balloons")
+
+        self.ocr_conf_spin = QSpinBox()
+        self.ocr_conf_spin.setRange(0, 100)
+        self.ocr_conf_spin.setValue(60)
+        self.ocr_conf_spin.setToolTip("OCR confidence threshold (higher = fewer suggestions)")
+
+        self.status = QLabel(
+            "Open a drawing. Manual: left-click to balloon. OCR: click Auto Detect (OCR), then click dashed circles to accept."
+        )
+        self.statusBar().addWidget(self.status)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        tb = QToolBar("Tools")
+        self.addToolBar(tb)
+
+        tb.addAction(self._action("Open", self.open_file))
+        tb.addAction(self._action("Export Image", self.export_image))
+
+        tb.addSeparator()
+        tb.addAction(self._action("Auto Detect (OCR)", self.auto_detect_ocr))
+        tb.addAction(self._action("Clear Suggestions", self.clear_suggestions))
+
+        tb.addSeparator()
+        tb.addAction(self._action("Undo", self.undo_last))
+        tb.addAction(self._action("Delete Selected", self.delete_selected))
+
+        tb.addSeparator()
+        tb.addAction(self._action("Rotate ⟳ 90°", lambda: self.rotate(90)))
+        tb.addAction(self._action("Rotate ⟲ 90°", lambda: self.rotate(-90)))
+        tb.addAction(self._action("Reset Rotation", self.reset_rotation))
+
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Bubble size: "))
+        tb.addWidget(self.radius_spin)
+        tb.addSeparator()
+        tb.addWidget(QLabel(" OCR conf ≥ "))
+        tb.addWidget(self.ocr_conf_spin)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.addWidget(self.view)
+        self.setCentralWidget(container)
+
+    def _action(self, text, slot):
+        act = QAction(text, self)
+        act.triggered.connect(slot)
+        return act
+
+    # -----------------------------
+    # File loading
+    # -----------------------------
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Drawing", "", "PDF (*.pdf);;Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
+        )
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".pdf"):
+                image = self._render_pdf_first_page(path, zoom=2.0)
+                self.load_image(image)
+            else:
+                img = QImage(path)
+                if img.isNull():
+                    raise ValueError("Could not open image.")
+                self.load_image(img)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Failed", f"Failed to open file:\n{e}")
+
+    def _render_pdf_first_page(self, pdf_path: str, zoom: float = 2.0) -> QImage:
+        doc = fitz.open(pdf_path)
+        if doc.page_count < 1:
+            raise ValueError("PDF has no pages.")
+        page = doc.load_page(0)
+
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+        return qimg.copy()
+
+    def load_image(self, image: QImage):
+        self.scene.clear()
+        self.base_image = image
+        self.original_image = image.copy()
+
+        self.balloons.clear()
+        self.balloon_items.clear()
+        self.suggestion_items.clear()
+
+        pix = QPixmap.fromImage(image)
+        self.scene.addItem(QGraphicsPixmapItem(pix))
+        self.scene.setSceneRect(pix.rect())
+        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+        self.status.setText("Loaded. Manual: click to balloon. OCR: Auto Detect (OCR) then click dashed circles to accept.")
+
+    # -----------------------------
+    # Manual balloons
+    # -----------------------------
+    def add_balloon(self, x: float, y: float):
+        if self.base_image is None:
+            QMessageBox.information(self, "No drawing loaded", "Open a drawing first.")
+            return
+
+        balloon_id = len(self.balloons) + 1
+        radius = float(self.radius_spin.value())
+        b = Balloon(balloon_id, x, y, radius)
+        item = BalloonItem(b)
+        item.setPos(x, y)
+        self.scene.addItem(item)
+        self.balloons.append(b)
+        self.balloon_items.append(item)
+        self._update_status()
+
+    def undo_last(self):
+        if not self.balloon_items:
+            return
+        item = self.balloon_items.pop()
+        self.scene.removeItem(item)
+        self.balloons.pop()
+        self.renumber()
+
+    def delete_selected(self):
+        selected = [it for it in self.balloon_items if it.isSelected()]
+        if not selected:
+            self.status.setText("No balloon selected. Click a balloon then press Delete.")
+            return
+
+        for item in selected:
+            idx = self.balloon_items.index(item)
+            self.scene.removeItem(item)
+            self.balloon_items.pop(idx)
+            self.balloons.pop(idx)
+
+        self.renumber()
+
+    def renumber(self):
+        for i, item in enumerate(self.balloon_items, start=1):
+            item.balloon.balloon_id = i
+        self.scene.update()
+        self._update_status()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.delete_selected()
+            return
+        super().keyPressEvent(event)
+
+    # -----------------------------
+    # Suggestions (OCR)
+    # -----------------------------
+    def clear_suggestions(self):
+        for it in self.suggestion_items:
+            self.scene.removeItem(it)
+        self.suggestion_items.clear()
+        self._update_status()
+
+    def accept_suggestion(self, suggestion_item: SuggestionItem):
+        pos = suggestion_item.pos()
+        # remove suggestion
+        self.scene.removeItem(suggestion_item)
+        if suggestion_item in self.suggestion_items:
+            self.suggestion_items.remove(suggestion_item)
+        # add real balloon
+        self.add_balloon(pos.x(), pos.y())
+
+    def _tesseract_available(self) -> bool:
+        # If user set explicit path and it exists -> OK
+        if os.path.exists(getattr(pytesseract.pytesseract, "tesseract_cmd", "")):
+            return True
+        # Otherwise check PATH
+        return shutil.which("tesseract") is not None
+
+    def auto_detect_ocr(self):
+        """
+        OCR-based semi-auto detection for scanned PDFs/images.
+        Creates clickable dashed suggestions on dimension-like text.
+        Skips reference-only dims in brackets: ( ... )
+        """
+        if self.base_image is None:
+            QMessageBox.information(self, "Auto Detect (OCR)", "Open a drawing first.")
+            return
+
+        if not self._tesseract_available():
+            QMessageBox.critical(
+                self,
+                "Tesseract not found",
+                "Tesseract OCR is not available.\n\n"
+                "Install Tesseract, or set TESSERACT_CMD at the top of app.py to the full path of tesseract.exe.\n"
+                "Typical path:\n  C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+            )
+            return
+
+        self.clear_suggestions()
+
+        # Convert QImage -> numpy (RGB)
+        # Convert QImage -> numpy (RGB)
+        img = self.base_image.convertToFormat(QImage.Format_RGB888)
+        w, h = img.width(), img.height()
+
+        ptr = img.bits()  # memoryview in newer PySide6
+        buf = ptr.tobytes()  # make bytes copy safely
+        arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 3))
+
+
+        # Preprocess for OCR
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        gray = cv2.medianBlur(gray, 3)
+        thr = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
+        )
+
+        # OCR data
+        conf_thresh = float(self.ocr_conf_spin.value())
+        config = r"--oem 3 --psm 6"
+        data = pytesseract.image_to_data(thr, output_type=pytesseract.Output.DICT, config=config)
+
+        # Collect suggestions (and dedupe close ones)
+        candidates: List[Suggestion] = []
+        n = len(data.get("text", []))
+
+        for i in range(n):
+            text = (data["text"][i] or "").strip()
+            conf_str = data["conf"][i]
+            try:
+                conf = float(conf_str)
+            except Exception:
+                conf = 0.0
+
+            if conf < conf_thresh:
+                continue
+            if not text:
+                continue
+            if is_reference_dimension(text):
+                continue
+            if not looks_like_dimension(text):
+                continue
+
+            x, y, bw, bh = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            cx, cy = x + bw / 2.0, y + bh / 2.0
+            candidates.append(Suggestion(cx, cy, text))
+
+        # Simple de-duplication by distance
+        deduped: List[Suggestion] = []
+        min_dist = 18  # px
+        for s in candidates:
+            keep = True
+            for d in deduped:
+                if (s.x - d.x) ** 2 + (s.y - d.y) ** 2 < (min_dist ** 2):
+                    keep = False
+                    break
+            if keep:
+                deduped.append(s)
+
+        # Create suggestion items
+        for s in deduped:
+            it = SuggestionItem(s, radius=16.0)
+            it.setPos(s.x, s.y)
+            self.scene.addItem(it)
+            self.suggestion_items.append(it)
+
+        self._update_status(extra=f"OCR suggestions created: {len(self.suggestion_items)}. Click dashed circles to accept.")
+
+    # -----------------------------
+    # Rotate / Reset
+    # -----------------------------
+    def rotate(self, angle_degrees: int):
+        if self.base_image is None:
+            return
+        t = QTransform().rotate(angle_degrees)
+        rotated = self.base_image.transformed(t, Qt.SmoothTransformation)
+        self.load_image(rotated)
+        self.status.setText("Rotated. (Balloons/suggestions cleared.)")
+
+    def reset_rotation(self):
+        if self.original_image is None:
+            return
+        self.load_image(self.original_image.copy())
+        self.status.setText("Rotation reset. (Balloons/suggestions cleared.)")
+
+    # -----------------------------
+    # Export image (print)
+    # -----------------------------
+    def export_image(self):
+        if self.base_image is None:
+            QMessageBox.information(self, "Nothing to export", "Open a drawing first.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save ballooned drawing", "ballooned_output.png", "PNG (*.png);;JPEG (*.jpg *.jpeg)"
+        )
+        if not file_path:
+            return
+
+        rect = self.scene.sceneRect()
+        img = QImage(int(rect.width()), int(rect.height()), QImage.Format_ARGB32)
+        img.fill(Qt.white)
+        painter = QPainter(img)
+        self.scene.render(painter)
+        painter.end()
+
+        if not img.save(file_path):
+            QMessageBox.critical(self, "Save Failed", "Could not save the image.")
+            return
+
+        self.status.setText(f"Saved: {os.path.basename(file_path)}")
+
+    # -----------------------------
+    # Status helper
+    # -----------------------------
+    def _update_status(self, extra: str = ""):
+        base = f"Balloons: {len(self.balloon_items)} | Suggestions: {len(self.suggestion_items)}"
+        self.status.setText(base + (f" | {extra}" if extra else ""))
+
+
+# -----------------------------
+# Entry point
+# -----------------------------
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
