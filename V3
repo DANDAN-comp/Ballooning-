@@ -1,0 +1,1068 @@
+# app.py
+# Manual ballooning tool (NO OCR / NO Tesseract)
+# Updated (more accurate Ref Location):
+# - Reference Location is AUTO-picked (no dialog box)
+#   using drawing border zone grid (letters on left/right, numbers on top/bottom),
+#   when PDF has real text.
+# - More accurate zone bounds using median label spacing (NOT page edges).
+# - Requirement is still auto-extracted near the click (when PDF has real text).
+#
+# Features:
+# - Open multi-page PDF (navigate pages) or single image
+# - Continuous balloon numbering across ALL pages
+# - Left-click: add balloon (unless clicking an existing balloon)
+# - Select + drag balloons
+# - Delete selected (Del/Backspace), Undo last
+# - Zoom with mouse wheel
+# - Pan by holding RIGHT mouse button and dragging
+# - Export ALL PAGES of ballooned drawing (PDF or per-page images)
+# - Export Form 3 table to Excel (.xlsx) or Word (.docx)
+
+import sys
+import os
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from PySide6.QtCore import Qt, QPointF, QRectF, QBuffer, QByteArray, QIODevice
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QFont,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTransform,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QSpinBox,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+import fitz  # PyMuPDF
+
+
+# -----------------------------
+# Data models
+# -----------------------------
+@dataclass
+class Balloon:
+    balloon_id: int
+    x: float
+    y: float
+    radius: float
+
+
+@dataclass
+class Form3Row:
+    char_number: int
+    reference_location: str = ""
+    characteristic_designator: str = "NA"
+    requirement: str = ""
+
+
+@dataclass
+class ZoneGrid:
+    col_labels: List[str]
+    col_bounds: List[float]  # len = len(col_labels)+1, PDF points
+    row_labels: List[str]
+    row_bounds: List[float]  # len = len(row_labels)+1, PDF points
+
+
+def _bounds_from_centers_spacing(centers: List[float], lo: float, hi: float) -> List[float]:
+    """
+    Build bounds from label centers using typical spacing, not page edges.
+    This greatly improves accuracy for drawings where labels sit inside a border.
+
+    Returns bounds length = len(centers)+1, monotonically increasing.
+    """
+    if len(centers) < 2:
+        return [lo, hi]
+
+    c = sorted(centers)
+
+    deltas = [b - a for a, b in zip(c, c[1:]) if (b - a) > 0.01]
+    deltas.sort()
+    step = deltas[len(deltas) // 2] if deltas else (hi - lo) / max(2, len(c))
+
+    left = max(lo, c[0] - step / 2.0)
+    right = min(hi, c[-1] + step / 2.0)
+
+    bounds = [left]
+    for a, b in zip(c, c[1:]):
+        bounds.append((a + b) / 2.0)
+    bounds.append(right)
+
+    # enforce monotonicity if text extraction glitches create overlaps
+    for i in range(1, len(bounds)):
+        if bounds[i] <= bounds[i - 1]:
+            bounds[i] = bounds[i - 1] + 0.001
+
+    return bounds
+
+
+# -----------------------------
+# Graphics items
+# -----------------------------
+class BalloonItem(QGraphicsItem):
+    """Numbered balloon."""
+
+    def __init__(self, balloon: Balloon):
+        super().__init__()
+        self.balloon = balloon
+        self.setFlags(
+            QGraphicsItem.ItemIsSelectable
+            | QGraphicsItem.ItemIsMovable
+            | QGraphicsItem.ItemIsFocusable
+        )
+
+    def boundingRect(self) -> QRectF:
+        r = self.balloon.radius
+        return QRectF(-r, -r, 2 * r, 2 * r)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        r = self.balloon.radius
+
+        painter.setPen(QPen(Qt.black, 2))
+        painter.setBrush(QBrush(Qt.white))
+        painter.drawEllipse(QPointF(0, 0), r, r)
+
+        text = str(self.balloon.balloon_id)
+        digits = len(text)
+        scale = 1.25 if digits == 1 else (1.05 if digits == 2 else 0.9)
+
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(max(10, int(r * scale)))
+        painter.setFont(font)
+        painter.setPen(Qt.black)
+
+        rect = QRectF(-r, -r, 2 * r, 2 * r)
+        painter.drawText(rect, Qt.AlignCenter, text)
+
+
+# -----------------------------
+# View (Zoom + Right-drag pan)
+# -----------------------------
+class DrawingView(QGraphicsView):
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self.main_window: Optional["MainWindow"] = None
+
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
+        self._panning = False
+        self._pan_start = None
+        self.setContextMenuPolicy(Qt.NoContextMenu)
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self._panning = True
+            self._pan_start = event.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+
+        if event.button() == Qt.LeftButton and self.main_window:
+            item = self.itemAt(event.position().toPoint())
+
+            if isinstance(item, BalloonItem):
+                super().mousePressEvent(event)
+                return
+
+            pos = self.mapToScene(event.position().toPoint())
+            self.main_window.add_balloon(pos.x(), pos.y())
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning and self._pan_start is not None:
+            delta = event.position().toPoint() - self._pan_start
+            self._pan_start = event.position().toPoint()
+
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+
+            event.accept()
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton and self._panning:
+            self._panning = False
+            self._pan_start = None
+            self.unsetCursor()
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
+
+
+# -----------------------------
+# Main window
+# -----------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Ballooning Tool (Manual, Multi-page PDF + Form 3 Export)")
+        self.resize(1200, 800)
+
+        self.scene = QGraphicsScene(self)
+        self.view = DrawingView(self.scene, self)
+        self.view.main_window = self
+
+        # Current displayed image/page
+        self.base_image: Optional[QImage] = None
+        self.original_image: Optional[QImage] = None
+
+        # PDF state
+        self.pdf_doc: Optional[fitz.Document] = None
+        self.pdf_path: Optional[str] = None
+        self.page_count: int = 1
+        self.current_page_index: int = 0  # 0-based
+
+        # Higher zoom = clearer. If memory gets too heavy, reduce to 5.0
+        self.pdf_zoom: float = 6.0
+
+        # Cache of enhanced rendered images
+        self._render_cache: Dict[int, QImage] = {}
+
+        # Cache of detected zone grids (per PDF page)
+        self._zone_grid_cache: Dict[int, ZoneGrid] = {}
+
+        # Balloons stored per page (continuous IDs across all pages)
+        self.balloons_by_page: Dict[int, List[Balloon]] = {}
+        self.balloon_items: List[BalloonItem] = []
+
+        # Form 3 rows keyed by balloon id
+        self.form3_by_balloon_id: Dict[int, Form3Row] = {}
+
+        self.radius_spin = QSpinBox()
+        self.radius_spin.setRange(10, 80)
+        self.radius_spin.setValue(18)
+        self.radius_spin.setToolTip("Bubble radius (px) for new balloons")
+
+        # Page controls
+        self.page_spin = QSpinBox()
+        self.page_spin.setRange(1, 1)
+        self.page_spin.setValue(1)
+        self.page_spin.setToolTip("PDF Page")
+        self.page_spin.valueChanged.connect(self._on_page_spin_changed)
+
+        self.page_label = QLabel(" / 1")
+        self.page_label.setToolTip("Current page / total pages")
+
+        self.status = QLabel("Open a PDF/image. Left-click to balloon. Right-drag to pan. Wheel to zoom.")
+        self.statusBar().addWidget(self.status)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        tb = QToolBar("Tools")
+        self.addToolBar(tb)
+
+        tb.addAction(self._action("Open", self.open_file))
+        tb.addAction(self._action("Export Ballooned Drawing (ALL pages)", self.export_output))
+        tb.addAction(self._action("Export Form 3 Table (Excel/Word)", self.export_form3))
+
+        tb.addSeparator()
+        self.prev_act = self._action("◀ Prev", self.prev_page)
+        self.next_act = self._action("Next ▶", self.next_page)
+        tb.addAction(self.prev_act)
+        tb.addAction(self.next_act)
+        tb.addWidget(QLabel(" Page: "))
+        tb.addWidget(self.page_spin)
+        tb.addWidget(self.page_label)
+
+        tb.addSeparator()
+        tb.addAction(self._action("Undo", self.undo_last))
+        tb.addAction(self._action("Delete Selected", self.delete_selected))
+
+        tb.addSeparator()
+        tb.addAction(self._action("Rotate ⟳ 90°", lambda: self.rotate(90)))
+        tb.addAction(self._action("Rotate ⟲ 90°", lambda: self.rotate(-90)))
+        tb.addAction(self._action("Reset Rotation", self.reset_rotation))
+
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Bubble size: "))
+        tb.addWidget(self.radius_spin)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.addWidget(self.view)
+        self.setCentralWidget(container)
+
+        self._update_page_controls()
+
+    def _action(self, text, slot):
+        act = QAction(text, self)
+        act.triggered.connect(slot)
+        return act
+
+    # -----------------------------
+    # Image enhancement (clearer/darker)
+    # -----------------------------
+    def _enhance_for_document_view(self, img: QImage) -> QImage:
+        """
+        Make drawings look darker/bolder:
+        - grayscale-like boost (still RGB)
+        - autocontrast (stretch)
+        - mild darken
+        - mild sharpen (cheap)
+        """
+        src = img.convertToFormat(QImage.Format_RGB888)
+        w, h = src.width(), src.height()
+        bpl = src.bytesPerLine()
+        raw = bytearray(src.bits().tobytes())
+
+        step = max(1, int((w * h) / 250000))
+        mins = 255
+        maxs = 0
+        for i in range(0, len(raw), 3 * step):
+            r, g, b = raw[i], raw[i + 1], raw[i + 2]
+            y = (r * 30 + g * 59 + b * 11) // 100
+            mins = min(mins, y)
+            maxs = max(maxs, y)
+
+        if maxs <= mins + 5:
+            mins, maxs = 0, 255
+
+        gamma = 0.90
+        inv_gamma = 1.0 / gamma
+
+        lut = [0] * 256
+        for i in range(256):
+            v = (i - mins) * 255 / max(1, (maxs - mins))
+            v = 0 if v < 0 else (255 if v > 255 else v)
+            v = int(((v / 255.0) ** inv_gamma) * 255.0 + 0.5)
+            v = max(0, min(255, v - 18))
+            lut[i] = v
+
+        for yy in range(h):
+            row = yy * bpl
+            for xx in range(w):
+                i = row + xx * 3
+                r, g, b = raw[i], raw[i + 1], raw[i + 2]
+                y = (r * 30 + g * 59 + b * 11) // 100
+                v = lut[y]
+                raw[i] = v
+                raw[i + 1] = v
+                raw[i + 2] = v
+
+        boosted = QImage(bytes(raw), w, h, bpl, QImage.Format_RGB888).copy()
+
+        sharp = QImage(boosted.size(), QImage.Format_RGB888)
+        sharp.fill(255)
+        p = QPainter(sharp)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawImage(0, 0, boosted)
+        p.setOpacity(0.18)
+        p.drawImage(1, 0, boosted)
+        p.drawImage(0, 1, boosted)
+        p.setOpacity(1.0)
+        p.end()
+        return sharp
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def _current_page_key(self) -> int:
+        return self.current_page_index if self.pdf_doc is not None else 0
+
+    def _total_balloons(self) -> int:
+        return sum(len(v) for v in self.balloons_by_page.values())
+
+    def _renumber_all_pages(self):
+        next_id = 1
+        page_iter = range(self.page_count if self.pdf_doc is not None else 1)
+        for p in page_iter:
+            page_list = self.balloons_by_page.get(p, [])
+            for b in page_list:
+                old = b.balloon_id
+                b.balloon_id = next_id
+                if old in self.form3_by_balloon_id and old != next_id:
+                    self.form3_by_balloon_id[next_id] = self.form3_by_balloon_id.pop(old)
+                    self.form3_by_balloon_id[next_id].char_number = next_id
+                next_id += 1
+
+        page_key = self._current_page_key()
+        current_list = self.balloons_by_page.get(page_key, [])
+        for item, b in zip(self.balloon_items, current_list):
+            item.balloon.balloon_id = b.balloon_id
+
+        self.scene.update()
+        self._update_status()
+
+    def _update_page_controls(self):
+        is_pdf = self.pdf_doc is not None and self.page_count > 1
+        self.prev_act.setEnabled(is_pdf and self.current_page_index > 0)
+        self.next_act.setEnabled(is_pdf and self.current_page_index < self.page_count - 1)
+        self.page_spin.setEnabled(is_pdf)
+
+    # -----------------------------
+    # File loading
+    # -----------------------------
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Drawing", "", "PDF (*.pdf);;Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
+        )
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".pdf"):
+                self._open_pdf(path)
+            else:
+                self._open_image(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Failed", f"Failed to open file:\n{e}")
+
+    def _open_pdf(self, pdf_path: str):
+        self.pdf_doc = fitz.open(pdf_path)
+        self.pdf_path = pdf_path
+        self.page_count = int(self.pdf_doc.page_count)
+        if self.page_count < 1:
+            raise ValueError("PDF has no pages.")
+
+        self.current_page_index = 0
+        self._render_cache.clear()
+        self._zone_grid_cache.clear()
+        self.balloons_by_page.clear()
+        self.form3_by_balloon_id.clear()
+
+        self.page_spin.blockSignals(True)
+        self.page_spin.setRange(1, self.page_count)
+        self.page_spin.setValue(1)
+        self.page_spin.blockSignals(False)
+        self.page_label.setText(f" / {self.page_count}")
+
+        self._load_pdf_page(0)
+        self._update_page_controls()
+
+    def _open_image(self, img_path: str):
+        img = QImage(img_path)
+        if img.isNull():
+            raise ValueError("Could not open image.")
+
+        self.pdf_doc = None
+        self.pdf_path = None
+        self.page_count = 1
+        self.current_page_index = 0
+        self._render_cache.clear()
+        self._zone_grid_cache.clear()
+        self.balloons_by_page.clear()
+        self.form3_by_balloon_id.clear()
+
+        self.page_spin.blockSignals(True)
+        self.page_spin.setRange(1, 1)
+        self.page_spin.setValue(1)
+        self.page_spin.blockSignals(False)
+        self.page_label.setText(" / 1")
+
+        enhanced = self._enhance_for_document_view(img)
+        self.load_image(enhanced, page_index=0)
+        self._update_page_controls()
+
+    def _render_pdf_page(self, page_index: int, zoom: float) -> QImage:
+        assert self.pdf_doc is not None
+        page = self.pdf_doc.load_page(page_index)
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+        return self._enhance_for_document_view(qimg)
+
+    def _get_page_image(self, page_index: int) -> QImage:
+        if self.pdf_doc is None:
+            assert self.base_image is not None
+            return self.base_image
+
+        if page_index in self._render_cache:
+            return self._render_cache[page_index]
+        img = self._render_pdf_page(page_index, self.pdf_zoom)
+        self._render_cache[page_index] = img
+        return img
+
+    def _load_pdf_page(self, page_index: int):
+        if self.pdf_doc is None:
+            return
+        page_index = max(0, min(page_index, self.page_count - 1))
+        self.current_page_index = page_index
+
+        img = self._get_page_image(page_index)
+        self.load_image(img, page_index=page_index)
+
+        self.page_spin.blockSignals(True)
+        self.page_spin.setValue(page_index + 1)
+        self.page_spin.blockSignals(False)
+
+        self._update_page_controls()
+        self._update_status()
+
+    def _on_page_spin_changed(self, val: int):
+        if self.pdf_doc is None:
+            return
+        self._load_pdf_page(val - 1)
+
+    def prev_page(self):
+        if self.pdf_doc is None:
+            return
+        self._load_pdf_page(self.current_page_index - 1)
+
+    def next_page(self):
+        if self.pdf_doc is None:
+            return
+        self._load_pdf_page(self.current_page_index + 1)
+
+    # -----------------------------
+    # Scene / page load
+    # -----------------------------
+    def load_image(self, image: QImage, page_index: int = 0):
+        self.scene.clear()
+        self.base_image = image
+        self.original_image = image.copy()
+
+        self.balloon_items.clear()
+
+        pix = QPixmap.fromImage(image)
+        self.scene.addItem(QGraphicsPixmapItem(pix))
+        self.scene.setSceneRect(pix.rect())
+        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+        page_balloons = self.balloons_by_page.get(page_index, [])
+        for b in page_balloons:
+            it = BalloonItem(b)
+            it.setPos(b.x, b.y)
+            self.scene.addItem(it)
+            self.balloon_items.append(it)
+
+        self._renumber_all_pages()
+
+    # -----------------------------
+    # Zone grid (Reference Location) auto-pick (MORE ACCURATE)
+    # -----------------------------
+    def _build_zone_grid_for_page(self, page_index: int) -> Optional[ZoneGrid]:
+        """
+        Builds a zone grid from border labels (NO OCR):
+        - Numbers: top and bottom strips
+        - Letters: left and right strips
+
+        Uses spacing-based bounds (half-cell beyond first/last label),
+        which is much more accurate than using page edges.
+        """
+        if self.pdf_doc is None:
+            return None
+        if page_index in self._zone_grid_cache:
+            return self._zone_grid_cache[page_index]
+
+        page = self.pdf_doc.load_page(page_index)
+        rect = page.rect
+        w, h = rect.width, rect.height
+
+        # Narrow strips -> less chance of picking title block / notes
+        top_strip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + h * 0.08)
+        bottom_strip = fitz.Rect(rect.x0, rect.y1 - h * 0.08, rect.x1, rect.y1)
+
+        left_strip = fitz.Rect(rect.x0, rect.y0, rect.x0 + w * 0.06, rect.y1)
+        right_strip = fitz.Rect(rect.x1 - w * 0.06, rect.y0, rect.x1, rect.y1)
+
+        words_top = page.get_text("words", clip=top_strip)
+        words_bottom = page.get_text("words", clip=bottom_strip)
+        words_left = page.get_text("words", clip=left_strip)
+        words_right = page.get_text("words", clip=right_strip)
+
+        col_items: Dict[str, float] = {}
+        for ww in (words_top + words_bottom):
+            txt = (ww[4] or "").strip()
+            if re.fullmatch(r"\d{1,3}", txt):
+                x0, y0, x1, y1 = ww[0], ww[1], ww[2], ww[3]
+                xc = (x0 + x1) / 2.0
+                col_items[txt] = (col_items.get(txt, xc) + xc) / 2.0 if txt in col_items else xc
+
+        row_items: Dict[str, float] = {}
+        for ww in (words_left + words_right):
+            txt = (ww[4] or "").strip()
+            if re.fullmatch(r"[A-Z]{1,2}", txt):
+                x0, y0, x1, y1 = ww[0], ww[1], ww[2], ww[3]
+                yc = (y0 + y1) / 2.0
+                row_items[txt] = (row_items.get(txt, yc) + yc) / 2.0 if txt in row_items else yc
+
+        if len(col_items) < 2 or len(row_items) < 2:
+            return None
+
+        col_labels = sorted(col_items.keys(), key=lambda k: col_items[k])
+        col_centers = [col_items[k] for k in col_labels]
+
+        row_labels = sorted(row_items.keys(), key=lambda k: row_items[k])
+        row_centers = [row_items[k] for k in row_labels]
+
+        col_bounds = _bounds_from_centers_spacing(col_centers, rect.x0, rect.x1)
+        row_bounds = _bounds_from_centers_spacing(row_centers, rect.y0, rect.y1)
+
+        grid = ZoneGrid(
+            col_labels=col_labels,
+            col_bounds=col_bounds,
+            row_labels=row_labels,
+            row_bounds=row_bounds,
+        )
+        self._zone_grid_cache[page_index] = grid
+        return grid
+
+    def _zone_from_point(self, page_index: int, x_pix: float, y_pix: float) -> str:
+        """
+        Convert click pixel coords -> PDF point coords -> Zone like C6.
+        Returns "" if not available (image or non-text PDF).
+        """
+        if self.pdf_doc is None:
+            return ""
+
+        grid = self._build_zone_grid_for_page(page_index)
+        if grid is None:
+            return ""
+
+        x_pt = x_pix / self.pdf_zoom
+        y_pt = y_pix / self.pdf_zoom
+
+        # Clamp into grid span (prevents None results near edges)
+        x_pt = max(grid.col_bounds[0], min(x_pt, grid.col_bounds[-1] - 1e-6))
+        y_pt = max(grid.row_bounds[0], min(y_pt, grid.row_bounds[-1] - 1e-6))
+
+        col_idx = next(
+            (i for i in range(len(grid.col_labels)) if grid.col_bounds[i] <= x_pt < grid.col_bounds[i + 1]),
+            len(grid.col_labels) - 1
+        )
+        row_idx = next(
+            (i for i in range(len(grid.row_labels)) if grid.row_bounds[i] <= y_pt < grid.row_bounds[i + 1]),
+            len(grid.row_labels) - 1
+        )
+
+        return f"{grid.row_labels[row_idx]}{grid.col_labels[col_idx]}"
+
+    # -----------------------------
+    # Auto-extract nearby Requirement text (no OCR)
+    # -----------------------------
+    def _extract_requirement_from_pdf(self, page_index: int, x_pix: float, y_pix: float) -> str:
+        if self.pdf_doc is None:
+            return ""
+
+        page = self.pdf_doc.load_page(page_index)
+
+        x_pt = x_pix / self.pdf_zoom
+        y_pt = y_pix / self.pdf_zoom
+
+        clip = fitz.Rect(x_pt - 200, y_pt - 60, x_pt + 600, y_pt + 60)
+        words = page.get_text("words", clip=clip)
+        if not words:
+            return ""
+
+        words.sort(key=lambda w: (round(w[1], 1), w[0]))
+        txt = " ".join(w[4] for w in words if isinstance(w[4], str)).strip()
+
+        normalized = txt.replace("⌀", "Ø")
+
+        patterns = [
+            r"(?:Ø|R)?\s*[\d]+(?:\.[\d]+)?\s*(?:in|mm)\s*±\s*[\d]+(?:\.[\d]+)?",
+            r"(?:Ø|R)?\s*[\d]+(?:\.[\d]+)?\s*±\s*[\d]+(?:\.[\d]+)?\s*(?:in|mm)",
+            r"(?:Ø|R)?\s*[\d]+(?:\.[\d]+)?\s*(?:in|mm)\s*\+\s*[\d]+(?:\.[\d]+)?\s*-\s*[\d]+(?:\.[\d]+)?",
+        ]
+        for pat in patterns:
+            m = re.search(pat, normalized)
+            if m:
+                return m.group(0).strip()
+
+        if "±" in normalized:
+            m = re.search(r"[\wØR\.]+\s*±\s*[\d]+(?:\.[\d]+)?", normalized)
+            if m:
+                return m.group(0).strip()
+
+        return ""
+
+    # -----------------------------
+    # Manual balloons (continuous numbering) + Form3 capture (NO dialog)
+    # -----------------------------
+    def add_balloon(self, x: float, y: float):
+        if self.base_image is None:
+            QMessageBox.information(self, "No drawing loaded", "Open a drawing first.")
+            return
+
+        page_key = self._current_page_key()
+        page_list = self.balloons_by_page.setdefault(page_key, [])
+
+        balloon_id = self._total_balloons() + 1
+        radius = float(self.radius_spin.value())
+
+        b = Balloon(balloon_id, x, y, radius)
+        it = BalloonItem(b)
+        it.setPos(x, y)
+
+        self.scene.addItem(it)
+        page_list.append(b)
+        self.balloon_items.append(it)
+
+        ref_loc = self._zone_from_point(page_key, x, y)
+        requirement = self._extract_requirement_from_pdf(page_key, x, y)
+
+        self.form3_by_balloon_id[balloon_id] = Form3Row(
+            char_number=balloon_id,
+            reference_location=ref_loc,
+            characteristic_designator="NA",
+            requirement=requirement,
+        )
+
+        extra = f"Ref: {ref_loc or '—'} | Req: {requirement or '—'}"
+        self._update_status(extra=extra)
+
+    def undo_last(self):
+        page_key = self._current_page_key()
+        page_list = self.balloons_by_page.get(page_key, [])
+        if not self.balloon_items or not page_list:
+            return
+
+        it = self.balloon_items.pop()
+        self.scene.removeItem(it)
+        b = page_list.pop()
+
+        self.form3_by_balloon_id.pop(b.balloon_id, None)
+        self._renumber_all_pages()
+
+    def delete_selected(self):
+        page_key = self._current_page_key()
+        page_list = self.balloons_by_page.get(page_key, [])
+        if not page_list:
+            return
+
+        selected_items = [it for it in self.balloon_items if it.isSelected()]
+        if not selected_items:
+            self.status.setText("No balloon selected. Click a balloon then press Delete.")
+            return
+
+        idxs = sorted((self.balloon_items.index(it) for it in selected_items), reverse=True)
+        for idx in idxs:
+            it = self.balloon_items[idx]
+            b = page_list[idx]
+            self.scene.removeItem(it)
+            self.balloon_items.pop(idx)
+            page_list.pop(idx)
+            self.form3_by_balloon_id.pop(b.balloon_id, None)
+
+        self._renumber_all_pages()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.delete_selected()
+            return
+        super().keyPressEvent(event)
+
+    # -----------------------------
+    # Rotate / Reset
+    # -----------------------------
+    def rotate(self, angle_degrees: int):
+        if self.base_image is None:
+            return
+        rotated = self.base_image.transformed(QTransform().rotate(angle_degrees), Qt.SmoothTransformation)
+
+        page_key = self._current_page_key()
+        for b in self.balloons_by_page.get(page_key, []):
+            self.form3_by_balloon_id.pop(b.balloon_id, None)
+        self.balloons_by_page[page_key] = []
+
+        if self.pdf_doc is not None:
+            self._render_cache.pop(self.current_page_index, None)
+            self._zone_grid_cache.pop(self.current_page_index, None)
+
+        self.load_image(rotated, page_index=page_key)
+        self.status.setText("Rotated. (Balloons cleared for this page.)")
+
+    def reset_rotation(self):
+        page_key = self._current_page_key()
+        for b in self.balloons_by_page.get(page_key, []):
+            self.form3_by_balloon_id.pop(b.balloon_id, None)
+        self.balloons_by_page[page_key] = []
+
+        if self.pdf_doc is not None:
+            self._render_cache.pop(self.current_page_index, None)
+            self._zone_grid_cache.pop(self.current_page_index, None)
+            self._load_pdf_page(self.current_page_index)
+            self.status.setText("Rotation reset. (Balloons cleared for this page.)")
+            return
+
+        if self.original_image is not None:
+            self.load_image(self.original_image.copy(), page_index=page_key)
+            self.status.setText("Rotation reset. (Balloons cleared for this page.)")
+
+    # -----------------------------
+    # Rendering helpers for Export ALL pages
+    # -----------------------------
+    def _render_page_with_balloons_to_image(self, page_index: int) -> QImage:
+        bg = self._get_page_image(page_index)
+
+        tmp_scene = QGraphicsScene()
+        pix = QPixmap.fromImage(bg)
+        tmp_scene.addItem(QGraphicsPixmapItem(pix))
+        tmp_scene.setSceneRect(pix.rect())
+
+        for b in self.balloons_by_page.get(page_index, []):
+            it = BalloonItem(b)
+            it.setPos(b.x, b.y)
+            tmp_scene.addItem(it)
+
+        rect = tmp_scene.sceneRect()
+        out_img = QImage(int(rect.width()), int(rect.height()), QImage.Format_ARGB32)
+        out_img.fill(Qt.white)
+
+        p = QPainter(out_img)
+        tmp_scene.render(p)
+        p.end()
+        return out_img
+
+    @staticmethod
+    def _qimage_to_png_bytes(img: QImage) -> bytes:
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.WriteOnly)
+        img.save(buf, "PNG")
+        buf.close()
+        return bytes(ba)
+
+    def _export_all_pages_to_pdf(self, pdf_path: str, dpi: int = 300) -> bool:
+        try:
+            out_doc = fitz.open()
+
+            page_total = self.page_count if self.pdf_doc is not None else 1
+            for i in range(page_total):
+                img = self._render_page_with_balloons_to_image(i)
+
+                w_pts = img.width() * 72.0 / dpi
+                h_pts = img.height() * 72.0 / dpi
+
+                page = out_doc.new_page(width=w_pts, height=h_pts)
+                png_bytes = self._qimage_to_png_bytes(img)
+                rect = fitz.Rect(0, 0, w_pts, h_pts)
+                page.insert_image(rect, stream=png_bytes)
+
+            out_doc.save(pdf_path)
+            out_doc.close()
+            return True
+        except Exception:
+            return False
+
+    def _export_all_pages_to_images(self, base_path: str, fmt: str) -> bool:
+        try:
+            root, ext = os.path.splitext(base_path)
+            ext = ext.lower()
+            if fmt.lower() == "jpg" and ext not in (".jpg", ".jpeg"):
+                ext = ".jpg"
+            if fmt.lower() == "png" and ext != ".png":
+                ext = ".png"
+
+            page_total = self.page_count if self.pdf_doc is not None else 1
+            pad = len(str(page_total))
+
+            for i in range(page_total):
+                img = self._render_page_with_balloons_to_image(i)
+                out_path = f"{root}_p{str(i+1).zfill(pad)}{ext}"
+                if not img.save(out_path):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    # -----------------------------
+    # Export Ballooned Drawing (ALL pages)
+    # -----------------------------
+    def export_output(self):
+        if self.base_image is None:
+            QMessageBox.information(self, "Nothing to export", "Open a drawing first.")
+            return
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export ballooned drawing (ALL pages)",
+            "ballooned_output.pdf",
+            "PDF (*.pdf);;PNG (*.png);;JPEG (*.jpg *.jpeg)",
+        )
+        if not file_path:
+            return
+
+        self._renumber_all_pages()
+
+        filt = selected_filter.upper()
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if "PDF" in filt or ext == ".pdf":
+            if ext != ".pdf":
+                file_path += ".pdf"
+
+            ok = self._export_all_pages_to_pdf(file_path, dpi=300)
+            if not ok:
+                QMessageBox.critical(self, "Save Failed", "Could not save the multi-page PDF.")
+                return
+
+            self.status.setText(f"Saved ALL pages to PDF: {os.path.basename(file_path)}")
+            return
+
+        if "PNG" in filt or ext == ".png":
+            ok = self._export_all_pages_to_images(file_path, fmt="png")
+            if not ok:
+                QMessageBox.critical(self, "Save Failed", "Could not export all pages as PNG images.")
+                return
+            self.status.setText("Saved ALL pages as PNG images (one file per page).")
+            return
+
+        ok = self._export_all_pages_to_images(file_path, fmt="jpg")
+        if not ok:
+            QMessageBox.critical(self, "Save Failed", "Could not export all pages as JPEG images.")
+            return
+        self.status.setText("Saved ALL pages as JPEG images (one file per page).")
+
+    # -----------------------------
+    # Export Form 3 table (Excel/Word)
+    # -----------------------------
+    def _form3_rows_sorted(self) -> List[Form3Row]:
+        rows = list(self.form3_by_balloon_id.values())
+        rows.sort(key=lambda r: r.char_number)
+        return rows
+
+    def export_form3(self):
+        if not self.form3_by_balloon_id:
+            QMessageBox.information(self, "No Form 3 data", "No balloon data captured yet.")
+            return
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Form 3 Table",
+            "FAI_Form3.xlsx",
+            "Excel (*.xlsx);;Word (*.docx)",
+        )
+        if not file_path:
+            return
+
+        filt = selected_filter.upper()
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if "EXCEL" in filt or ext == ".xlsx":
+            if ext != ".xlsx":
+                file_path += ".xlsx"
+            ok = self._export_form3_xlsx(file_path)
+            if not ok:
+                QMessageBox.critical(self, "Export Failed", "Excel export failed. Ensure openpyxl is installed.")
+                return
+            self.status.setText(f"Saved Form 3 Excel: {os.path.basename(file_path)}")
+            return
+
+        if ext != ".docx":
+            file_path += ".docx"
+        ok = self._export_form3_docx(file_path)
+        if not ok:
+            QMessageBox.critical(self, "Export Failed", "Word export failed. Ensure python-docx is installed.")
+            return
+        self.status.setText(f"Saved Form 3 Word: {os.path.basename(file_path)}")
+
+    def _export_form3_xlsx(self, path: str) -> bool:
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, Alignment, Border, Side
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "FAI Form 3"
+
+            headers = ["5. Char. Number", "6. Reference Location", "7. Characteristic Designator", "8. Requirement"]
+            ws.append(headers)
+
+            bold = Font(bold=True)
+            for col in range(1, len(headers) + 1):
+                cell = ws.cell(row=1, column=col)
+                cell.font = bold
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+            thin = Side(style="thin", color="000000")
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            for r in self._form3_rows_sorted():
+                ws.append([r.char_number, r.reference_location, r.characteristic_designator, r.requirement])
+
+            for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=4):
+                for cell in row:
+                    cell.border = border
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+            ws.column_dimensions["A"].width = 16
+            ws.column_dimensions["B"].width = 22
+            ws.column_dimensions["C"].width = 28
+            ws.column_dimensions["D"].width = 38
+
+            wb.save(path)
+            return True
+        except Exception:
+            return False
+
+    def _export_form3_docx(self, path: str) -> bool:
+        try:
+            from docx import Document
+
+            doc = Document()
+            doc.add_heading("FAI Form 3", level=1)
+
+            rows = self._form3_rows_sorted()
+            table = doc.add_table(rows=len(rows) + 1, cols=4)
+            table.style = "Table Grid"
+
+            headers = ["5. Char. Number", "6. Reference Location", "7. Characteristic Designator", "8. Requirement"]
+            for i, h in enumerate(headers):
+                table.cell(0, i).text = h
+
+            for idx, r in enumerate(rows, start=1):
+                table.cell(idx, 0).text = str(r.char_number)
+                table.cell(idx, 1).text = r.reference_location
+                table.cell(idx, 2).text = r.characteristic_designator
+                table.cell(idx, 3).text = r.requirement
+
+            doc.save(path)
+            return True
+        except Exception:
+            return False
+
+    # -----------------------------
+    # Status helper
+    # -----------------------------
+    def _update_status(self, extra: str = ""):
+        total = self._total_balloons()
+        if self.pdf_doc is not None:
+            base = f"Page {self.current_page_index + 1}/{self.page_count} | Total balloons: {total}"
+        else:
+            base = f"Total balloons: {total}"
+        self.status.setText(base + (f" | {extra}" if extra else ""))
+
+
+# -----------------------------
+# Entry point
+# -----------------------------
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
